@@ -18,9 +18,8 @@ struct grecorder {
 	GstElement *vpe_queue;
 	GstElement *encode;
 	GstElement *encode_queue;
-	GstElement *video_convert;
-	GstElement *qt_mux;
-	GstElement *filesink;
+	GstElement *appsink;
+	GMainLoop  *loop;
 };
 
 /**
@@ -67,6 +66,104 @@ static void intr_handler (int signum)
 			G_TYPE_STRING, "Pipeline interrupted", NULL)));
 }
 
+static GstFlowReturn on_new_sample_from_sink(GstElement *sink_elm, struct grecorder *data)
+{
+	GstSample *sample = NULL;
+	GstBuffer *buffer, *app_buffer;
+	GstElement *sink, *source;
+	GstFlowReturn ret;
+	GstMapInfo map;
+
+	/* get the sample from appsink */
+	//sample = gst_app_sink_pull_sample (GST_APP_SINK (sink_elm));
+#if 0
+	sink = gst_bin_get_by_name (GST_BIN (data->src_pipeline), "testsink");
+	g_signal_emit_by_name (sink, "pull-sample", &sample, &ret);
+	gst_object_unref (sink);
+#else
+	g_signal_emit_by_name(sink_elm, "pull-sample", &sample, &ret);
+#endif
+
+	if(sample){
+		buffer = gst_sample_get_buffer (sample);
+		g_print("on_new_sample_from_sink() call!; size = %d\n", gst_buffer_get_size(buffer));
+	}
+	else{
+		g_print("sample is NULL \n");
+		return ret;
+	}
+
+
+	/* pull sample data */
+#if 1
+	/* Mapping a buffer can fail (non-readable) */
+	if (gst_buffer_map (buffer, &map, GST_MAP_READ)) {
+		/* print the buffer data for debug */
+		int i = 0, j = 0;
+		for(; i < 10; i++)
+			g_print("%x ", map.data[i]);
+		g_print("\n");
+	}
+#endif
+
+	/* we don't need the appsink sample anymore */
+	gst_sample_unref (sample);
+
+	return ret;
+
+}
+static gboolean on_appsink_message (GstBus * bus, GstMessage * msg, struct grecorder *data)
+{
+	GstElement *source;
+	GError *err;
+	gchar *debug_info;
+
+	switch (GST_MESSAGE_TYPE (msg)) {
+	case GST_MESSAGE_EOS:
+		g_print ("The source got dry\n");
+		source = gst_bin_get_by_name (GST_BIN (data->pipeline), "app_sink");
+		//gst_app_src_end_of_stream (GST_APP_SRC (source));
+		g_signal_emit_by_name (source, "end-of-stream", NULL);
+		gst_object_unref (source);
+		g_print ("End-Of-Stream reached.\n");
+		break;
+
+	case GST_MESSAGE_ERROR:
+		gst_message_parse_error (msg, &err, &debug_info);
+		g_printerr ("Error received from element %s: %s\n",
+				GST_OBJECT_NAME (msg->src), err->message);
+		g_printerr ("Debugging information: %s\n",
+				debug_info ? debug_info : "none");
+		g_main_loop_quit (data->loop);
+		g_clear_error (&err);
+		g_free (debug_info);
+		break;
+
+	case GST_MESSAGE_NEW_CLOCK:
+		g_print ("New Clock Detect.\n");
+		break;
+
+	case GST_MESSAGE_APPLICATION:
+		{
+			const GstStructure *s;
+			s = gst_message_get_structure(msg);
+			if (gst_structure_has_name(s, "GstLaunchInterrupt")) {
+				g_print("Interrupt: Stopping pipeline ...\n");
+				g_main_loop_quit (data->loop);
+			}
+		}
+		break;
+
+	default:
+		/* We should not reach here because we only asked for ERRORs and EOS */
+		g_printerr ("Unexpected message received, message type name %s.\n",
+				GST_MESSAGE_TYPE_NAME(msg));
+		break;
+
+	}
+	return TRUE;
+}
+
 int main (int argc, char **argv)
 {
 	int width = 0;
@@ -93,6 +190,7 @@ int main (int argc, char **argv)
 	GstCaps *raw_video_caps = NULL;
 	GstBus *bus = NULL;
 	GstMessage *msg = NULL;
+	GstElement *appsink = NULL;
 
 	command = argv[0];
 
@@ -134,8 +232,8 @@ int main (int argc, char **argv)
 		return -1;
 	}
 
-	g_print("camera:%s resolution %dx%d, format=%s, bitrate=%dkbps, output=%s\n",
-			camera, width, height, fourcc, bitrate, output);
+	g_print("camera:%s resolution %dx%d, format=%s, bitrate=%dkbps\n",
+			camera, width, height, fourcc, bitrate);
 
 	/* Init Gstreamer */
 	gst_init(&argc, &argv);
@@ -146,32 +244,30 @@ int main (int argc, char **argv)
 		return -1;
 	}
 
+	recorder.loop = g_main_loop_new(NULL, FALSE);
 	recorder.camera_dev = gst_element_factory_make("v4l2src", "video_source");
 	recorder.vpe = gst_element_factory_make("vpe","ti_vpe");
 	recorder.vpe_queue = gst_element_factory_make("queue", "vpe_queue");
 	recorder.encode = gst_element_factory_make("ducatih264enc", "h264encoder");
 	recorder.encode_queue = gst_element_factory_make("queue", "encode_queue");
-	recorder.video_convert = gst_element_factory_make("h264parse", "video_convert");
-	recorder.qt_mux = gst_element_factory_make("qtmux", "quick_time_muxer");
-	recorder.filesink = gst_element_factory_make("filesink", "filesink");
+	recorder.appsink = gst_element_factory_make("appsink", "app_sink");
 
 	if (!recorder.camera_dev || !recorder.vpe || !recorder.vpe_queue || !recorder.encode ||
-			!recorder.encode_queue || !recorder.video_convert || !recorder.qt_mux ||
-			!recorder.filesink) {
+			!recorder.encode_queue || !recorder.appsink) {
 		g_printerr("No resource to create one element.\n");
 		return -1;
 	}
 
 	gst_bin_add_many(GST_BIN(recorder.pipeline), recorder.camera_dev, recorder.vpe,
 			recorder.vpe_queue, recorder.encode, recorder.encode_queue,
-			recorder.video_convert, recorder.qt_mux, recorder.filesink, NULL);
+			recorder.appsink, NULL);
 
 	/* Setup camera_dev element property */
 	g_object_set(G_OBJECT(recorder.camera_dev), "device", camera, "io-mode", 4, NULL);
 	/* Setup vpe property */
 	g_object_set(G_OBJECT(recorder.vpe), "num-input-buffers", 8, NULL);
 	g_object_set(G_OBJECT(recorder.encode), "bitrate", bitrate, NULL);
-	g_object_set(G_OBJECT(recorder.filesink), "location", output, NULL);
+	//g_object_set(G_OBJECT(recorder.filesink), "location", output, NULL);
 	/* cap filter between camera and vpe */
 	raw_video_caps = gst_caps_new_simple("video/x-raw",
 			"format", G_TYPE_STRING, fourcc,
@@ -191,8 +287,17 @@ int main (int argc, char **argv)
 	}
 
 	gst_element_link_many(recorder.vpe, recorder.vpe_queue, recorder.encode,
-			recorder.encode_queue, recorder.video_convert,
-			recorder.qt_mux, recorder.filesink, NULL);
+			recorder.encode_queue, recorder.appsink, NULL);
+
+	bus = gst_element_get_bus(recorder.pipeline);
+	gst_bus_add_watch(bus, (GstBusFunc) on_appsink_message, &recorder);
+	gst_object_unref(bus);
+
+
+	appsink = gst_bin_get_by_name(GST_BIN(recorder.pipeline), "app_sink");
+	g_object_set(G_OBJECT(appsink), "emit-signals", TRUE, "sync", FALSE, NULL);
+	g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample_from_sink), &recorder);
+	gst_object_unref(appsink);
 
 	err = gst_element_set_state(recorder.pipeline, GST_STATE_PLAYING);
 	if (err == GST_STATE_CHANGE_FAILURE) {
@@ -202,56 +307,11 @@ int main (int argc, char **argv)
 	}
 
 	signal(SIGINT, intr_handler);
+	g_main_loop_run(recorder.loop);
 
-	bus = gst_element_get_bus(recorder.pipeline);
-
-	/* Parse message */
-	do {
-		GError *err;
-		gchar *debug_info;
-		msg = gst_bus_timed_pop_filtered (bus, GST_CLOCK_TIME_NONE,
-				GST_MESSAGE_ERROR | GST_MESSAGE_NEW_CLOCK | GST_MESSAGE_EOS);
-
-		switch (GST_MESSAGE_TYPE (msg)) {
-		case GST_MESSAGE_ERROR:
-			gst_message_parse_error (msg, &err, &debug_info);
-			g_printerr ("Error received from element %s: %s\n",
-					GST_OBJECT_NAME (msg->src), err->message);
-			g_printerr ("Debugging information: %s\n",
-					debug_info ? debug_info : "none");
-			g_clear_error (&err);
-			g_free (debug_info);
-			goto end;
-			break;
-		case GST_MESSAGE_EOS:
-			g_print ("End-Of-Stream reached.\n");
-			goto end;
-			break;
-		case GST_MESSAGE_NEW_CLOCK:
-			g_print ("New Clock Detect.\n");
-			break;
-		case GST_MESSAGE_APPLICATION: {
-				const GstStructure *s;
-				s = gst_message_get_structure(msg);
-				if (gst_structure_has_name(s, "GstLaunchInterrupt")) {
-					g_print("Interrupt: Stopping pipeline ...\n");
-					goto end;
-				}
-			}
-			break;
-		default:
-			/* We should not reach here because we only asked for ERRORs and EOS */
-			g_printerr ("Unexpected message received, message type name %s.\n",
-					GST_MESSAGE_TYPE_NAME(msg));
-			break;
-		}
-		gst_message_unref (msg);
-	} while (1);
-end:
 	gst_element_set_state(recorder.pipeline, GST_STATE_PAUSED);
 	gst_element_set_state(recorder.pipeline, GST_STATE_READY);
 	gst_element_set_state(recorder.pipeline, GST_STATE_NULL);
-	g_object_unref(bus);
 	g_object_unref(recorder.pipeline);
 	gst_deinit();
 
